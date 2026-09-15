@@ -1,412 +1,553 @@
-from __future__ import annotations
-
-import io
-import re
-from dataclasses import dataclass
-from datetime import date
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-
-import pandas as pd
-import plotly.express as px
 import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from pathlib import Path
 
-st.set_page_config(page_title="Actual Freight Cost Dashboard", page_icon="🚚", layout="wide")
+# ==========================================================
+# PAGE CONFIG
+# ==========================================================
 
-STANDARD_COLUMNS = [
-    "Carrier", "Type of goods", "Date", "Origin", "Destination",
-    "Value", "Currency", "Value EUR", "Source", "Freight Document"
-]
+st.set_page_config(
+    page_title="Freight Cost Analytics",
+    page_icon="🚚",
+    layout="wide"
+)
 
-ALIASES = {
-    "freight_document": ["Freight Document", "Freight Document Number", "Freight Doc.", "Freight Doc", "Freight Order", "Freight Booking"],
-    "conversion_currency": ["Currency", "From Currency", "Source Currency", "Curr.", "Local Curr."],
-    "conversion_rate": ["Conversion Rate", "Rate", "Rate to EUR", "EUR Rate", "Exchange Rate"],
-}
+st.title("🚚 Freight Cost Analytics Dashboard")
+st.markdown(
+    """
+    Upload:
+    - Manual Accruals file
+    - SAP ERP file
 
-@dataclass(frozen=True)
-class UploadSpec:
-    label: str
-    key: str
-    help: str
+    Master files are automatically loaded locally.
+    """
+)
 
-UPLOADS = [
-    UploadSpec("Manual accruals", "manual", "Manual accrual cost extract"),
-    UploadSpec("SAP ERP", "erp", "SAP ERP freight cost extract"),
-    UploadSpec("SAP TM", "tm", "SAP TM freight cost extract"),
-    UploadSpec("ERP Carrier Name", "carrier", "ServcAgent to Name 1 mapping"),
-    UploadSpec("ERP Shipping Point", "shipping", "ShPt to Description mapping"),
-    UploadSpec("ERP Customers", "customer", "Ship-To to Name 1 mapping"),
-    UploadSpec("ERP Plants", "plant", "Plnt to Name 1 mapping"),
-    UploadSpec("TM FO", "tm_fo", "TM details for freight documents starting with 68"),
-    UploadSpec("TM FB", "tm_fb", "TM details for freight documents starting with 69"),
-    UploadSpec("Currency conversion table", "fx", "Currency-to-EUR conversion rates"),
-]
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
 
+MASTER_FOLDER = "master_data"
 
-def norm_header(value: object) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
+ERP_CARRIER_FILE = f"{MASTER_FOLDER}/ERP Carrier Name.xlsx"
+ERP_CUSTOMERS_FILE = f"{MASTER_FOLDER}/ERP Customers.xlsx"
+ERP_PLANTS_FILE = f"{MASTER_FOLDER}/ERP Plants.xlsx"
+ERP_SHIPPING_FILE = f"{MASTER_FOLDER}/ERP Shipping Point.xlsx"
+CURRENCY_FILE = f"{MASTER_FOLDER}/Currency conversion table.xlsx"
 
+# ==========================================================
+# HELPERS
+# ==========================================================
 
-def clean_key(series: pd.Series) -> pd.Series:
-    def one(value: object) -> object:
-        if pd.isna(value):
-            return pd.NA
-        text = str(value).strip()
-        text = re.sub(r"\.0$", "", text)
-        return text if text else pd.NA
-    return series.map(one).astype("string")
-
-
-def find_col(df: pd.DataFrame, names: Sequence[str], required: bool = True) -> Optional[str]:
-    by_norm = {norm_header(c): c for c in df.columns}
-    for name in names:
-        if norm_header(name) in by_norm:
-            return by_norm[norm_header(name)]
-    if required:
-        raise KeyError(f"Missing column. Expected one of: {', '.join(names)}")
-    return None
+@st.cache_data
+def load_excel(file):
+    return pd.read_excel(file)
 
 
-def read_uploaded(uploaded) -> pd.DataFrame:
-    name = uploaded.name.lower()
-    raw = uploaded.getvalue()
-    if name.endswith((".xlsx", ".xlsm")):
-        return pd.read_excel(io.BytesIO(raw), engine="openpyxl", dtype=object)
-    if name.endswith(".xls"):
-        return pd.read_excel(io.BytesIO(raw), engine="xlrd", dtype=object)
-    if name.endswith(".csv"):
-        for encoding in ("utf-8-sig", "utf-8", "cp1252"):
-            try:
-                return pd.read_csv(io.BytesIO(raw), sep=None, engine="python", encoding=encoding, dtype=object)
-            except UnicodeDecodeError:
-                continue
-        raise ValueError("CSV encoding could not be detected.")
-    raise ValueError("Supported formats are .xlsx, .xlsm, .xls and .csv")
+def clean_carrier(value):
+    if pd.isna(value):
+        return value
+
+    value = str(value)
+
+    if "/" in value:
+        return value.split("/")[0].strip()
+
+    return value.strip()
 
 
-def parse_amount(series: pd.Series) -> pd.Series:
-    def one(value: object) -> float:
-        if pd.isna(value) or str(value).strip() == "":
-            return float("nan")
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
-        text = str(value).strip().replace("\u00a0", "").replace(" ", "")
-        negative = text.startswith("(") and text.endswith(")")
-        text = text.strip("()")
-        text = re.sub(r"[^0-9,\.\-]", "", text)
-        if "," in text and "." in text:
-            if text.rfind(",") > text.rfind("."):
-                text = text.replace(".", "").replace(",", ".")
-            else:
-                text = text.replace(",", "")
-        elif "," in text:
-            lhs, rhs = text.rsplit(",", 1)
-            text = lhs.replace(",", "") + ("." + rhs if len(rhs) <= 2 else rhs)
-        number = float(text)
-        return -number if negative else number
-    return series.map(one)
+def normalize_currency(value):
+    if pd.isna(value):
+        return None
+
+    return str(value).strip().upper()
 
 
-def parse_dates(series: pd.Series) -> pd.Series:
-    # Handles native Excel dates, common text dates and Excel serial dates.
-    numeric = pd.to_numeric(series, errors="coerce")
-    parsed = pd.to_datetime(series, errors="coerce", dayfirst=True)
-    serial_mask = parsed.isna() & numeric.between(1, 100000)
-    parsed.loc[serial_mask] = pd.to_datetime(numeric.loc[serial_mask], unit="D", origin="1899-12-30", errors="coerce")
-    return parsed
-
-
-def clean_dimension(series: pd.Series, fallback: str = "Unknown") -> pd.Series:
-    return series.astype("string").str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA}).fillna(fallback)
-
-
-def build_lookup(df: pd.DataFrame, key_names: Sequence[str], value_names: Sequence[str]) -> Dict[str, str]:
-    key_col = find_col(df, key_names)
-    value_col = find_col(df, value_names)
-    temp = pd.DataFrame({"key": clean_key(df[key_col]), "value": clean_dimension(df[value_col], "")})
-    temp = temp.dropna(subset=["key"]).drop_duplicates("key", keep="last")
-    return dict(zip(temp["key"], temp["value"]))
-
-
-def base_output(df: pd.DataFrame, source: str) -> pd.DataFrame:
-    out = df.copy()
-    out["Source"] = source
-    for col in STANDARD_COLUMNS:
-        if col not in out:
-            out[col] = pd.NA
-    return out[STANDARD_COLUMNS]
-
-
-def transform_manual(df: pd.DataFrame) -> pd.DataFrame:
-    carrier = find_col(df, ["Carrier Description"])
-    goods = find_col(df, ["PBU"])
-    dt = find_col(df, ["Planned Arrival Date-Last Stop", "Planned Arrival Date Last Stop"])
-    origin = find_col(df, ["Source Location Description"])
-    destination = find_col(df, ["Destination Location Descripti", "Destination Location Description"])
-    value = find_col(df, ["Net Amt in Doc Crcy"])
-    currency = find_col(df, ["Currency"])
-    out = pd.DataFrame({
-        "Carrier": df[carrier].astype("string").str.split("/", n=1).str[0].str.strip(),
-        "Type of goods": df[goods],
-        "Date": parse_dates(df[dt]),
-        "Origin": df[origin],
-        "Destination": df[destination],
-        "Value": parse_amount(df[value]),
-        "Currency": df[currency],
-    })
-    return base_output(out, "Manual accruals")
-
-
-def transform_erp(df: pd.DataFrame, carrier_df: pd.DataFrame, shipping_df: pd.DataFrame,
-                  customer_df: pd.DataFrame, plant_df: pd.DataFrame) -> pd.DataFrame:
-    service = find_col(df, ["ServcAgent", "Service Agent"])
-    goods = find_col(df, ["Product Hierarchy"])
-    dt = find_col(df, ["Deliv.Date", "Delivery Date"])
-    shpt = find_col(df, ["ShPt", "Shipping Point"])
-    ship_to = find_col(df, ["Ship-To", "Ship To"])
-    plant = find_col(df, ["Plnt", "Plant"])
-    value = find_col(df, ["Loc.curr.amount", "Local Currency Amount"])
-    currency = find_col(df, ["Local Curr.", "Local Currency"])
-
-    carrier_map = build_lookup(carrier_df, ["ServcAgent", "Service Agent", "Number", "Vendor"], ["Name 1"])
-    shipping_map = build_lookup(shipping_df, ["ShPt", "Shipping Point", "Code"], ["Description"])
-    customer_map = build_lookup(customer_df, ["Ship-To", "Ship To", "Customer", "Number"], ["Name 1"])
-    plant_map = build_lookup(plant_df, ["Plnt", "Plant", "Code"], ["Name 1"])
-
-    service_key = clean_key(df[service])
-    shpt_key = clean_key(df[shpt])
-    ship_to_key = clean_key(df[ship_to])
-    plant_key = clean_key(df[plant])
-    hierarchy = clean_key(df[goods]).fillna("")
-
-    mapped_carrier = service_key.map(carrier_map).fillna(service_key)
-    mapped_origin = shpt_key.map(shipping_map)
-    mapped_origin = mapped_origin.where(shpt_key.notna(), "Import").fillna(shpt_key)
-    mapped_destination = ship_to_key.map(customer_map)
-    plant_destination = plant_key.map(plant_map).fillna(plant_key)
-    mapped_destination = mapped_destination.where(ship_to_key.notna(), plant_destination).fillna(ship_to_key)
-
-    out = pd.DataFrame({
-        "Carrier": mapped_carrier,
-        "Type of goods": hierarchy.str.startswith(("1", "4")).map({True: "FG", False: "NFG"}),
-        "Date": parse_dates(df[dt]),
-        "Origin": mapped_origin,
-        "Destination": mapped_destination,
-        "Value": parse_amount(df[value]),
-        "Currency": df[currency],
-    })
-    return base_output(out, "SAP ERP")
-
-
-def tm_detail_lookup(df: pd.DataFrame, kind: str) -> pd.DataFrame:
-    doc_col = find_col(df, ALIASES["freight_document"])
-    if kind == "FO":
-        actual = find_col(df, ["Actual Delivered Date"], required=False)
-        planned = find_col(df, ["Planned Arrival Date-Last Stop", "Planned Arrival Date Last Stop"])
-        actual_dates = parse_dates(df[actual]) if actual else pd.Series(pd.NaT, index=df.index)
-        chosen_date = actual_dates.fillna(parse_dates(df[planned]))
-    else:
-        expected = find_col(df, ["Expected Arrival Date"])
-        chosen_date = parse_dates(df[expected])
-    origin = find_col(df, ["Source Location Description"])
-    destination = find_col(df, ["Destination Location Descripti", "Destination Location Description"])
-    detail = pd.DataFrame({
-        "Freight Document": clean_key(df[doc_col]),
-        "TM Date": chosen_date,
-        "TM Origin": df[origin],
-        "TM Destination": df[destination],
-    })
-    return detail.dropna(subset=["Freight Document"]).drop_duplicates("Freight Document", keep="last")
-
-
-def transform_tm(df: pd.DataFrame, fo_df: pd.DataFrame, fb_df: pd.DataFrame) -> pd.DataFrame:
-    doc = find_col(df, ALIASES["freight_document"])
-    carrier = find_col(df, ["Invoicing Party"])
-    value = find_col(df, ["Net Amt in Doc Crcy"])
-    currency = find_col(df, ["Currency"])
-
-    cost = pd.DataFrame({
-        "Freight Document": clean_key(df[doc]),
-        "Carrier": df[carrier],
-        "Value": parse_amount(df[value]),
-        "Currency": df[currency],
-    })
-    details = pd.concat([tm_detail_lookup(fo_df, "FO"), tm_detail_lookup(fb_df, "FB")], ignore_index=True)
-    details = details.drop_duplicates("Freight Document", keep="last")
-    merged = cost.merge(details, on="Freight Document", how="left", validate="m:1")
-    prefixes = merged["Freight Document"].fillna("").str[:2]
-    merged.loc[~prefixes.isin(["68", "69"]), ["TM Date", "TM Origin", "TM Destination"]] = pd.NA
-    out = pd.DataFrame({
-        "Carrier": merged["Carrier"],
-        "Type of goods": "Unknown",
-        "Date": merged["TM Date"],
-        "Origin": merged["TM Origin"],
-        "Destination": merged["TM Destination"],
-        "Value": merged["Value"],
-        "Currency": merged["Currency"],
-        "Freight Document": merged["Freight Document"],
-    })
-    return base_output(out, "SAP TM")
-
-
-def build_fx(df: pd.DataFrame) -> Tuple[Dict[str, float], str]:
-    currency_col = find_col(df, ALIASES["conversion_currency"])
-    rate_col = find_col(df, ALIASES["conversion_rate"])
-    currency = df[currency_col].astype("string").str.upper().str.strip()
-    rate = parse_amount(df[rate_col])
-    temp = pd.DataFrame({"Currency": currency, "Rate": rate}).dropna()
-    temp = temp.drop_duplicates("Currency", keep="last")
-    rates = dict(zip(temp["Currency"], temp["Rate"]))
-    rates["EUR"] = 1.0
-    return rates, rate_col
-
-
-def add_eur(data: pd.DataFrame, fx_df: pd.DataFrame, convention: str) -> Tuple[pd.DataFrame, List[str]]:
-    rates, _ = build_fx(fx_df)
-    out = data.copy()
-    out["Currency"] = out["Currency"].astype("string").str.upper().str.strip()
-    out["FX Rate"] = out["Currency"].map(rates)
-    if convention == "1 unit of currency = rate EUR":
-        out["Value EUR"] = out["Value"] * out["FX Rate"]
-    else:
-        out["Value EUR"] = out["Value"] / out["FX Rate"]
-    missing = sorted(out.loc[out["FX Rate"].isna() & out["Currency"].notna(), "Currency"].dropna().unique().tolist())
-    return out, missing
-
-
-def style_clean(data: pd.DataFrame) -> pd.DataFrame:
-    out = data.copy()
-    for col in ["Carrier", "Type of goods", "Origin", "Destination", "Currency", "Source"]:
-        out[col] = clean_dimension(out[col])
-    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-    return out
-
-
-def multiselect_filter(label: str, values: pd.Series, key: str) -> List[str]:
-    options = sorted(values.dropna().astype(str).unique().tolist())
-    return st.sidebar.multiselect(label, options, default=[], key=key, placeholder="All")
-
-
-def apply_filters(data: pd.DataFrame) -> pd.DataFrame:
-    filtered = data.copy()
-    st.sidebar.header("Filters")
-    valid_dates = filtered["Date"].dropna()
-    if not valid_dates.empty:
-        min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
-        chosen = st.sidebar.date_input("Period", value=(min_date, max_date), min_value=min_date, max_value=max_date)
-        if isinstance(chosen, (tuple, list)) and len(chosen) == 2:
-            filtered = filtered[filtered["Date"].dt.date.between(chosen[0], chosen[1])]
-    for label, col, key in [
-        ("Source", "Source", "f_source"), ("Carrier", "Carrier", "f_carrier"),
-        ("Type of goods", "Type of goods", "f_goods"), ("Origin", "Origin", "f_origin"),
-        ("Destination", "Destination", "f_destination"), ("Original currency", "Currency", "f_currency")
-    ]:
-        selected = multiselect_filter(label, filtered[col], key)
-        if selected:
-            filtered = filtered[filtered[col].astype(str).isin(selected)]
-    return filtered
-
-
-st.title("🚚 Actual Freight Cost Dashboard")
-st.caption("Consolidates Manual accruals, SAP ERP and SAP TM; maps master data; converts values to EUR; and provides interactive analysis.")
-
-with st.sidebar:
-    st.header("1. Upload files")
-    files = {}
-    for spec in UPLOADS:
-        files[spec.key] = st.file_uploader(spec.label, type=["xlsx", "xlsm", "xls", "csv"], key=spec.key, help=spec.help)
-    st.header("2. Currency rule")
-    fx_convention = st.radio(
-        "Interpret conversion rate as",
-        ["1 unit of currency = rate EUR", "1 EUR = rate units of currency"],
-        help="Choose the convention used by the Currency conversion table."
-    )
-    build = st.button("Build dashboard", type="primary", use_container_width=True)
-
-if not build:
-    st.info("Upload all ten files in the sidebar, select the conversion-rate convention, then click **Build dashboard**.")
-    st.stop()
-
-missing_files = [spec.label for spec in UPLOADS if files[spec.key] is None]
-if missing_files:
-    st.error("Missing required files: " + ", ".join(missing_files))
-    st.stop()
+# ==========================================================
+# LOAD STATIC FILES
+# ==========================================================
 
 try:
-    frames = {key: read_uploaded(upload) for key, upload in files.items()}
-    manual = transform_manual(frames["manual"])
-    erp = transform_erp(frames["erp"], frames["carrier"], frames["shipping"], frames["customer"], frames["plant"])
-    tm = transform_tm(frames["tm"], frames["tm_fo"], frames["tm_fb"])
-    combined = style_clean(pd.concat([manual, erp, tm], ignore_index=True))
-    combined, missing_fx = add_eur(combined, frames["fx"], fx_convention)
-except Exception as exc:
-    st.exception(exc)
+    carrier_master = load_excel(ERP_CARRIER_FILE)
+    customer_master = load_excel(ERP_CUSTOMERS_FILE)
+    plant_master = load_excel(ERP_PLANTS_FILE)
+    shipping_master = load_excel(ERP_SHIPPING_FILE)
+    currency_master = load_excel(CURRENCY_FILE)
+
+except Exception as e:
+    st.error(f"Unable to load master files: {e}")
     st.stop()
 
-if missing_fx:
-    st.warning("No EUR conversion rate found for: " + ", ".join(missing_fx) + ". Those rows remain visible but have no Value EUR.")
+# ==========================================================
+# FILE UPLOADS
+# ==========================================================
 
-quality = {
-    "Rows loaded": len(combined),
-    "Missing date": int(combined["Date"].isna().sum()),
-    "Missing FX": int(combined["FX Rate"].isna().sum()),
-    "Missing EUR value": int(combined["Value EUR"].isna().sum()),
-}
+manual_file = st.file_uploader(
+    "Upload Manual Accruals",
+    type=["xlsx", "xls"]
+)
 
-filtered = apply_filters(combined)
+sap_file = st.file_uploader(
+    "Upload SAP ERP",
+    type=["xlsx", "xls"]
+)
 
-st.subheader("Overview")
+if not manual_file or not sap_file:
+    st.stop()
+
+# ==========================================================
+# LOAD DATA
+# ==========================================================
+
+manual_raw = pd.read_excel(manual_file)
+sap_raw = pd.read_excel(sap_file)
+
+# ==========================================================
+# MANUAL ACCRUALS TRANSFORMATION
+# ==========================================================
+
+manual = pd.DataFrame()
+
+manual["Carrier"] = (
+    manual_raw["Carrier Description"]
+    .astype(str)
+    .apply(clean_carrier)
+)
+
+manual["Type of Goods"] = manual_raw["PBU"]
+
+manual["Date"] = pd.to_datetime(
+    manual_raw["Planned Arrival Date-Last Stop"],
+    errors="coerce"
+)
+
+manual["Origin"] = manual_raw["Source Location Description"]
+
+manual["Destination"] = manual_raw["Destination Location Descripti"]
+
+manual["Value"] = pd.to_numeric(
+    manual_raw["Net Amt in Doc Crcy"],
+    errors="coerce"
+)
+
+manual["Currency"] = (
+    manual_raw["Currency"]
+    .astype(str)
+    .apply(normalize_currency)
+)
+
+manual["Source"] = "Manual Accruals"
+
+# ==========================================================
+# SAP ERP TRANSFORMATION
+# ==========================================================
+
+sap = sap_raw.copy()
+
+# ----------------------------------------------------------
+# CARRIER
+# ----------------------------------------------------------
+
+carrier_master["CarrierKey"] = (
+    carrier_master["ServcAgent"]
+    .astype(str)
+    .str.strip()
+)
+
+sap["CarrierKey"] = (
+    sap["ServcAgent"]
+    .astype(str)
+    .str.strip()
+)
+
+sap = sap.merge(
+    carrier_master[["CarrierKey", "Name 1"]],
+    on="CarrierKey",
+    how="left"
+)
+
+sap["Carrier"] = sap["Name 1"]
+
+# ----------------------------------------------------------
+# TYPE OF GOODS
+# ----------------------------------------------------------
+
+def classify_goods(x):
+
+    if pd.isna(x):
+        return "NFG"
+
+    value = str(x).strip()
+
+    if value.startswith("1") or value.startswith("4"):
+        return "FG"
+
+    return "NFG"
+
+sap["Type of Goods"] = (
+    sap["Product Hierarchy"]
+    .apply(classify_goods)
+)
+
+# ----------------------------------------------------------
+# DATE
+# ----------------------------------------------------------
+
+sap["Date"] = pd.to_datetime(
+    sap["Deliv.Date"],
+    errors="coerce"
+)
+
+# ----------------------------------------------------------
+# ORIGIN
+# ----------------------------------------------------------
+
+shipping_master["ShPtKey"] = (
+    shipping_master["ShPt"]
+    .astype(str)
+    .str.strip()
+)
+
+sap["ShPtKey"] = (
+    sap["ShPt"]
+    .astype(str)
+    .str.strip()
+)
+
+sap = sap.merge(
+    shipping_master[["ShPtKey", "Description"]],
+    on="ShPtKey",
+    how="left"
+)
+
+sap["Origin"] = np.where(
+    sap["ShPt"].isna(),
+    "Import",
+    sap["Description"]
+)
+
+# ----------------------------------------------------------
+# DESTINATION
+# ----------------------------------------------------------
+
+customer_master["ShipToKey"] = (
+    customer_master["Ship-To"]
+    .astype(str)
+    .str.strip()
+)
+
+sap["ShipToKey"] = (
+    sap["Ship-To"]
+    .astype(str)
+    .str.strip()
+)
+
+sap = sap.merge(
+    customer_master[["ShipToKey", "Name 1"]],
+    on="ShipToKey",
+    how="left",
+    suffixes=("", "_Customer")
+)
+
+plant_master["PlantKey"] = (
+    plant_master["Plnt"]
+    .astype(str)
+    .str.strip()
+)
+
+sap["PlantKey"] = (
+    sap["Plnt"]
+    .astype(str)
+    .str.strip()
+)
+
+sap = sap.merge(
+    plant_master[["PlantKey", "Name 1"]],
+    on="PlantKey",
+    how="left",
+    suffixes=("", "_Plant")
+)
+
+sap["Destination"] = np.where(
+    sap["Ship-To"].isna(),
+    sap["Name 1_Plant"],
+    sap["Name 1"]
+)
+
+# ----------------------------------------------------------
+# VALUE / CURRENCY
+# ----------------------------------------------------------
+
+sap["Value"] = pd.to_numeric(
+    sap["Loc.curr.amount"],
+    errors="coerce"
+)
+
+sap["Currency"] = (
+    sap["Local Curr."]
+    .astype(str)
+    .apply(normalize_currency)
+)
+
+sap["Source"] = "SAP ERP"
+
+sap_final = sap[
+    [
+        "Carrier",
+        "Type of Goods",
+        "Date",
+        "Origin",
+        "Destination",
+        "Value",
+        "Currency",
+        "Source",
+    ]
+]
+
+# ==========================================================
+# EUR CONVERSION
+# ==========================================================
+
+currency_master.columns = [
+    c.strip()
+    for c in currency_master.columns
+]
+
+currency_master["Currency"] = (
+    currency_master["Currency"]
+    .astype(str)
+    .str.upper()
+)
+
+combined = pd.concat(
+    [manual, sap_final],
+    ignore_index=True
+)
+
+combined = combined.merge(
+    currency_master,
+    on="Currency",
+    how="left"
+)
+
+rate_column = None
+
+for c in currency_master.columns:
+    if "rate" in c.lower():
+        rate_column = c
+        break
+
+if rate_column is None:
+    st.error(
+        "Currency conversion file must contain a column with 'Rate' in the name."
+    )
+    st.stop()
+
+combined["EUR Rate"] = combined[rate_column]
+
+combined["Value EUR"] = np.where(
+    combined["Currency"] == "EUR",
+    combined["Value"],
+    combined["Value"] * combined["EUR Rate"]
+)
+
+combined["Year"] = combined["Date"].dt.year
+combined["Month"] = combined["Date"].dt.strftime("%Y-%m")
+
+# ==========================================================
+# SIDEBAR FILTERS
+# ==========================================================
+
+st.sidebar.header("Filters")
+
+carrier_filter = st.sidebar.multiselect(
+    "Carrier",
+    sorted(combined["Carrier"].dropna().unique())
+)
+
+goods_filter = st.sidebar.multiselect(
+    "Type of Goods",
+    sorted(combined["Type of Goods"].dropna().unique())
+)
+
+origin_filter = st.sidebar.multiselect(
+    "Origin",
+    sorted(combined["Origin"].dropna().unique())
+)
+
+destination_filter = st.sidebar.multiselect(
+    "Destination",
+    sorted(combined["Destination"].dropna().unique())
+)
+
+source_filter = st.sidebar.multiselect(
+    "Source",
+    sorted(combined["Source"].dropna().unique())
+)
+
+filtered = combined.copy()
+
+if carrier_filter:
+    filtered = filtered[
+        filtered["Carrier"].isin(carrier_filter)
+    ]
+
+if goods_filter:
+    filtered = filtered[
+        filtered["Type of Goods"].isin(goods_filter)
+    ]
+
+if origin_filter:
+    filtered = filtered[
+        filtered["Origin"].isin(origin_filter)
+    ]
+
+if destination_filter:
+    filtered = filtered[
+        filtered["Destination"].isin(destination_filter)
+    ]
+
+if source_filter:
+    filtered = filtered[
+        filtered["Source"].isin(source_filter)
+    ]
+
+# ==========================================================
+# KPIs
+# ==========================================================
+
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Freight cost (EUR)", f"€{filtered['Value EUR'].sum():,.2f}")
-k2.metric("Transactions", f"{len(filtered):,}")
-k3.metric("Carriers", f"{filtered['Carrier'].nunique():,}")
-k4.metric("Average cost / transaction", f"€{filtered['Value EUR'].mean():,.2f}" if filtered["Value EUR"].notna().any() else "n/a")
 
-if filtered.empty:
-    st.warning("No records match the selected filters.")
-    st.stop()
+k1.metric(
+    "Spend EUR",
+    f"€ {filtered['Value EUR'].sum():,.0f}"
+)
 
-monthly = (filtered.dropna(subset=["Date", "Value EUR"])
-           .assign(Month=lambda x: x["Date"].dt.to_period("M").dt.to_timestamp())
-           .groupby(["Month", "Source"], as_index=False)["Value EUR"].sum())
-carrier_cost = (filtered.groupby("Carrier", as_index=False)["Value EUR"].sum()
-                .sort_values("Value EUR", ascending=False).head(15))
-route_cost = (filtered.assign(Route=filtered["Origin"] + " → " + filtered["Destination"])
-              .groupby("Route", as_index=False)["Value EUR"].sum()
-              .sort_values("Value EUR", ascending=False).head(15))
-source_cost = filtered.groupby("Source", as_index=False)["Value EUR"].sum()
+k2.metric(
+    "Shipments",
+    f"{len(filtered):,}"
+)
 
-c1, c2 = st.columns(2)
-with c1:
-    st.plotly_chart(px.line(monthly, x="Month", y="Value EUR", color="Source", markers=True,
-                            title="Monthly freight costs", labels={"Value EUR": "Cost (EUR)"}), use_container_width=True)
-with c2:
-    st.plotly_chart(px.bar(carrier_cost.sort_values("Value EUR"), x="Value EUR", y="Carrier", orientation="h",
-                           title="Top 15 carriers", labels={"Value EUR": "Cost (EUR)"}), use_container_width=True)
+k3.metric(
+    "Carriers",
+    filtered["Carrier"].nunique()
+)
 
-c3, c4 = st.columns(2)
-with c3:
-    st.plotly_chart(px.bar(route_cost.sort_values("Value EUR"), x="Value EUR", y="Route", orientation="h",
-                           title="Top 15 routes", labels={"Value EUR": "Cost (EUR)"}), use_container_width=True)
-with c4:
-    st.plotly_chart(px.pie(source_cost, names="Source", values="Value EUR", hole=0.45,
-                           title="Cost split by source"), use_container_width=True)
+k4.metric(
+    "Origins",
+    filtered["Origin"].nunique()
+)
 
-st.subheader("Detailed transactions")
-display_cols = ["Source", "Freight Document", "Carrier", "Type of goods", "Date", "Origin", "Destination", "Value", "Currency", "FX Rate", "Value EUR"]
-st.dataframe(filtered[display_cols].sort_values("Date", ascending=False), use_container_width=True, hide_index=True,
-             column_config={
-                 "Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
-                 "Value": st.column_config.NumberColumn(format="%.2f"),
-                 "FX Rate": st.column_config.NumberColumn(format="%.6f"),
-                 "Value EUR": st.column_config.NumberColumn(format="€%.2f"),
-             })
+# ==========================================================
+# CHARTS
+# ==========================================================
 
-csv = filtered[display_cols].to_csv(index=False).encode("utf-8-sig")
-st.download_button("Download filtered data (CSV)", csv, "actual_freight_costs_filtered.csv", "text/csv")
+st.subheader("Monthly Spend")
 
-with st.expander("Data quality summary"):
-    qcols = st.columns(len(quality))
-    for col, (name, value) in zip(qcols, quality.items()):
-        col.metric(name, f"{value:,}")
-    st.write("Unmapped master-data keys fall back to their original code. Empty dimensions are shown as Unknown. SAP ERP empty ShPt is shown as Import.")
+monthly = (
+    filtered
+    .groupby("Month", as_index=False)["Value EUR"]
+    .sum()
+)
+
+fig = px.line(
+    monthly,
+    x="Month",
+    y="Value EUR",
+    markers=True
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# ----------------------------------------------------------
+
+col1, col2 = st.columns(2)
+
+with col1:
+
+    spend_by_carrier = (
+        filtered
+        .groupby("Carrier", as_index=False)["Value EUR"]
+        .sum()
+        .sort_values("Value EUR", ascending=False)
+        .head(15)
+    )
+
+    fig = px.bar(
+        spend_by_carrier,
+        x="Carrier",
+        y="Value EUR",
+        title="Top Carriers"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+with col2:
+
+    spend_by_goods = (
+        filtered
+        .groupby("Type of Goods", as_index=False)["Value EUR"]
+        .sum()
+    )
+
+    fig = px.pie(
+        spend_by_goods,
+        names="Type of Goods",
+        values="Value EUR",
+        title="FG vs NFG"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+# ----------------------------------------------------------
+
+route_spend = (
+    filtered
+    .groupby(
+        ["Origin", "Destination"],
+        as_index=False
+    )["Value EUR"]
+    .sum()
+    .sort_values("Value EUR", ascending=False)
+    .head(20)
+)
+
+fig = px.bar(
+    route_spend,
+    x="Origin",
+    y="Value EUR",
+    color="Destination",
+    title="Top Freight Lanes"
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# ==========================================================
+# DETAIL TABLE
+# ==========================================================
+
+st.subheader("Detailed Freight Cost Data")
+
+st.dataframe(
+    filtered.sort_values(
+        "Date",
+        ascending=False
+    ),
+    use_container_width=True,
+    height=500
+)
+
+# ==========================================================
+# EXPORT
+# ==========================================================
+
+csv = filtered.to_csv(index=False).encode("utf-8")
+
+st.download_button(
+    "Download Filtered Data",
+    csv,
+    "freight_spend.csv",
+    "text/csv"
+)

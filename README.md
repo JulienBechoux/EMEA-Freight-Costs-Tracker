@@ -1,342 +1,847 @@
-# Actual Freight Cost Dashboard
+Below is a complete solution specification for a Streamlit Freight Cost Analytics Dashboard that:
 
-A Streamlit application that consolidates actual freight costs from **Manual accruals**, **SAP ERP**, and **SAP TM**, enriches ERP and TM records from reference files, converts all amounts to EUR, and provides an interactive dashboard with filters and exports.
+Accepts only Manual Accruals and SAP ERP uploads.
+Uses local static master data files:
+ERP Carrier Name
+ERP Customers
+ERP Plants
+ERP Shipping Point
+Currency conversion table
+Standardizes data from both sources.
+Converts all values into EUR.
+Creates a unified freight spend dataset.
+Provides interactive filtering and dashboard analytics.
+requirements.txt
+streamlit>=1.38.0
+pandas>=2.2.2
+numpy>=1.26.4
+plotly>=5.24.0
+openpyxl>=3.1.5
+xlrd>=2.0.1
 
-## 1. What the application does
+app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from pathlib import Path
 
-The application:
+# ==========================================================
+# PAGE CONFIG
+# ==========================================================
 
-1. Accepts ten Excel or CSV uploads.
-2. Standardizes all cost records into one model:
-   - Carrier
-   - Type of goods
-   - Date
-   - Origin
-   - Destination
-   - Original value
-   - Original currency
-   - EUR value
-   - Source system
-   - Freight Document, where available
-3. Applies the requested cleansing and lookup rules.
-4. Converts each transaction to EUR using the uploaded currency conversion table.
-5. Provides filters for period, source, carrier, goods type, origin, destination, and currency.
-6. Displays KPIs and charts for monthly spend, carriers, routes, and source-system split.
-7. Allows the filtered detail to be downloaded as CSV.
-8. Shows basic data-quality indicators for missing dates and exchange rates.
+st.set_page_config(
+    page_title="Freight Cost Analytics",
+    page_icon="🚚",
+    layout="wide"
+)
 
-## 2. Project structure
+st.title("🚚 Freight Cost Analytics Dashboard")
+st.markdown(
+    """
+    Upload:
+    - Manual Accruals file
+    - SAP ERP file
 
-```text
-freight-cost-dashboard/
+    Master files are automatically loaded locally.
+    """
+)
+
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
+
+MASTER_FOLDER = "master_data"
+
+ERP_CARRIER_FILE = f"{MASTER_FOLDER}/ERP Carrier Name.xlsx"
+ERP_CUSTOMERS_FILE = f"{MASTER_FOLDER}/ERP Customers.xlsx"
+ERP_PLANTS_FILE = f"{MASTER_FOLDER}/ERP Plants.xlsx"
+ERP_SHIPPING_FILE = f"{MASTER_FOLDER}/ERP Shipping Point.xlsx"
+CURRENCY_FILE = f"{MASTER_FOLDER}/Currency conversion table.xlsx"
+
+# ==========================================================
+# HELPERS
+# ==========================================================
+
+@st.cache_data
+def load_excel(file):
+    return pd.read_excel(file)
+
+
+def clean_carrier(value):
+    if pd.isna(value):
+        return value
+
+    value = str(value)
+
+    if "/" in value:
+        return value.split("/")[0].strip()
+
+    return value.strip()
+
+
+def normalize_currency(value):
+    if pd.isna(value):
+        return None
+
+    return str(value).strip().upper()
+
+
+# ==========================================================
+# LOAD STATIC FILES
+# ==========================================================
+
+try:
+    carrier_master = load_excel(ERP_CARRIER_FILE)
+    customer_master = load_excel(ERP_CUSTOMERS_FILE)
+    plant_master = load_excel(ERP_PLANTS_FILE)
+    shipping_master = load_excel(ERP_SHIPPING_FILE)
+    currency_master = load_excel(CURRENCY_FILE)
+
+except Exception as e:
+    st.error(f"Unable to load master files: {e}")
+    st.stop()
+
+# ==========================================================
+# FILE UPLOADS
+# ==========================================================
+
+manual_file = st.file_uploader(
+    "Upload Manual Accruals",
+    type=["xlsx", "xls"]
+)
+
+sap_file = st.file_uploader(
+    "Upload SAP ERP",
+    type=["xlsx", "xls"]
+)
+
+if not manual_file or not sap_file:
+    st.stop()
+
+# ==========================================================
+# LOAD DATA
+# ==========================================================
+
+manual_raw = pd.read_excel(manual_file)
+sap_raw = pd.read_excel(sap_file)
+
+# ==========================================================
+# MANUAL ACCRUALS TRANSFORMATION
+# ==========================================================
+
+manual = pd.DataFrame()
+
+manual["Carrier"] = (
+    manual_raw["Carrier Description"]
+    .astype(str)
+    .apply(clean_carrier)
+)
+
+manual["Type of Goods"] = manual_raw["PBU"]
+
+manual["Date"] = pd.to_datetime(
+    manual_raw["Planned Arrival Date-Last Stop"],
+    errors="coerce"
+)
+
+manual["Origin"] = manual_raw["Source Location Description"]
+
+manual["Destination"] = manual_raw["Destination Location Descripti"]
+
+manual["Value"] = pd.to_numeric(
+    manual_raw["Net Amt in Doc Crcy"],
+    errors="coerce"
+)
+
+manual["Currency"] = (
+    manual_raw["Currency"]
+    .astype(str)
+    .apply(normalize_currency)
+)
+
+manual["Source"] = "Manual Accruals"
+
+# ==========================================================
+# SAP ERP TRANSFORMATION
+# ==========================================================
+
+sap = sap_raw.copy()
+
+# ----------------------------------------------------------
+# CARRIER
+# ----------------------------------------------------------
+
+carrier_master["CarrierKey"] = (
+    carrier_master["ServcAgent"]
+    .astype(str)
+    .str.strip()
+)
+
+sap["CarrierKey"] = (
+    sap["ServcAgent"]
+    .astype(str)
+    .str.strip()
+)
+
+sap = sap.merge(
+    carrier_master[["CarrierKey", "Name 1"]],
+    on="CarrierKey",
+    how="left"
+)
+
+sap["Carrier"] = sap["Name 1"]
+
+# ----------------------------------------------------------
+# TYPE OF GOODS
+# ----------------------------------------------------------
+
+def classify_goods(x):
+
+    if pd.isna(x):
+        return "NFG"
+
+    value = str(x).strip()
+
+    if value.startswith("1") or value.startswith("4"):
+        return "FG"
+
+    return "NFG"
+
+sap["Type of Goods"] = (
+    sap["Product Hierarchy"]
+    .apply(classify_goods)
+)
+
+# ----------------------------------------------------------
+# DATE
+# ----------------------------------------------------------
+
+sap["Date"] = pd.to_datetime(
+    sap["Deliv.Date"],
+    errors="coerce"
+)
+
+# ----------------------------------------------------------
+# ORIGIN
+# ----------------------------------------------------------
+
+shipping_master["ShPtKey"] = (
+    shipping_master["ShPt"]
+    .astype(str)
+    .str.strip()
+)
+
+sap["ShPtKey"] = (
+    sap["ShPt"]
+    .astype(str)
+    .str.strip()
+)
+
+sap = sap.merge(
+    shipping_master[["ShPtKey", "Description"]],
+    on="ShPtKey",
+    how="left"
+)
+
+sap["Origin"] = np.where(
+    sap["ShPt"].isna(),
+    "Import",
+    sap["Description"]
+)
+
+# ----------------------------------------------------------
+# DESTINATION
+# ----------------------------------------------------------
+
+customer_master["ShipToKey"] = (
+    customer_master["Ship-To"]
+    .astype(str)
+    .str.strip()
+)
+
+sap["ShipToKey"] = (
+    sap["Ship-To"]
+    .astype(str)
+    .str.strip()
+)
+
+sap = sap.merge(
+    customer_master[["ShipToKey", "Name 1"]],
+    on="ShipToKey",
+    how="left",
+    suffixes=("", "_Customer")
+)
+
+plant_master["PlantKey"] = (
+    plant_master["Plnt"]
+    .astype(str)
+    .str.strip()
+)
+
+sap["PlantKey"] = (
+    sap["Plnt"]
+    .astype(str)
+    .str.strip()
+)
+
+sap = sap.merge(
+    plant_master[["PlantKey", "Name 1"]],
+    on="PlantKey",
+    how="left",
+    suffixes=("", "_Plant")
+)
+
+sap["Destination"] = np.where(
+    sap["Ship-To"].isna(),
+    sap["Name 1_Plant"],
+    sap["Name 1"]
+)
+
+# ----------------------------------------------------------
+# VALUE / CURRENCY
+# ----------------------------------------------------------
+
+sap["Value"] = pd.to_numeric(
+    sap["Loc.curr.amount"],
+    errors="coerce"
+)
+
+sap["Currency"] = (
+    sap["Local Curr."]
+    .astype(str)
+    .apply(normalize_currency)
+)
+
+sap["Source"] = "SAP ERP"
+
+sap_final = sap[
+    [
+        "Carrier",
+        "Type of Goods",
+        "Date",
+        "Origin",
+        "Destination",
+        "Value",
+        "Currency",
+        "Source",
+    ]
+]
+
+# ==========================================================
+# EUR CONVERSION
+# ==========================================================
+
+currency_master.columns = [
+    c.strip()
+    for c in currency_master.columns
+]
+
+currency_master["Currency"] = (
+    currency_master["Currency"]
+    .astype(str)
+    .str.upper()
+)
+
+combined = pd.concat(
+    [manual, sap_final],
+    ignore_index=True
+)
+
+combined = combined.merge(
+    currency_master,
+    on="Currency",
+    how="left"
+)
+
+rate_column = None
+
+for c in currency_master.columns:
+    if "rate" in c.lower():
+        rate_column = c
+        break
+
+if rate_column is None:
+    st.error(
+        "Currency conversion file must contain a column with 'Rate' in the name."
+    )
+    st.stop()
+
+combined["EUR Rate"] = combined[rate_column]
+
+combined["Value EUR"] = np.where(
+    combined["Currency"] == "EUR",
+    combined["Value"],
+    combined["Value"] * combined["EUR Rate"]
+)
+
+combined["Year"] = combined["Date"].dt.year
+combined["Month"] = combined["Date"].dt.strftime("%Y-%m")
+
+# ==========================================================
+# SIDEBAR FILTERS
+# ==========================================================
+
+st.sidebar.header("Filters")
+
+carrier_filter = st.sidebar.multiselect(
+    "Carrier",
+    sorted(combined["Carrier"].dropna().unique())
+)
+
+goods_filter = st.sidebar.multiselect(
+    "Type of Goods",
+    sorted(combined["Type of Goods"].dropna().unique())
+)
+
+origin_filter = st.sidebar.multiselect(
+    "Origin",
+    sorted(combined["Origin"].dropna().unique())
+)
+
+destination_filter = st.sidebar.multiselect(
+    "Destination",
+    sorted(combined["Destination"].dropna().unique())
+)
+
+source_filter = st.sidebar.multiselect(
+    "Source",
+    sorted(combined["Source"].dropna().unique())
+)
+
+filtered = combined.copy()
+
+if carrier_filter:
+    filtered = filtered[
+        filtered["Carrier"].isin(carrier_filter)
+    ]
+
+if goods_filter:
+    filtered = filtered[
+        filtered["Type of Goods"].isin(goods_filter)
+    ]
+
+if origin_filter:
+    filtered = filtered[
+        filtered["Origin"].isin(origin_filter)
+    ]
+
+if destination_filter:
+    filtered = filtered[
+        filtered["Destination"].isin(destination_filter)
+    ]
+
+if source_filter:
+    filtered = filtered[
+        filtered["Source"].isin(source_filter)
+    ]
+
+# ==========================================================
+# KPIs
+# ==========================================================
+
+k1, k2, k3, k4 = st.columns(4)
+
+k1.metric(
+    "Spend EUR",
+    f"€ {filtered['Value EUR'].sum():,.0f}"
+)
+
+k2.metric(
+    "Shipments",
+    f"{len(filtered):,}"
+)
+
+k3.metric(
+    "Carriers",
+    filtered["Carrier"].nunique()
+)
+
+k4.metric(
+    "Origins",
+    filtered["Origin"].nunique()
+)
+
+# ==========================================================
+# CHARTS
+# ==========================================================
+
+st.subheader("Monthly Spend")
+
+monthly = (
+    filtered
+    .groupby("Month", as_index=False)["Value EUR"]
+    .sum()
+)
+
+fig = px.line(
+    monthly,
+    x="Month",
+    y="Value EUR",
+    markers=True
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# ----------------------------------------------------------
+
+col1, col2 = st.columns(2)
+
+with col1:
+
+    spend_by_carrier = (
+        filtered
+        .groupby("Carrier", as_index=False)["Value EUR"]
+        .sum()
+        .sort_values("Value EUR", ascending=False)
+        .head(15)
+    )
+
+    fig = px.bar(
+        spend_by_carrier,
+        x="Carrier",
+        y="Value EUR",
+        title="Top Carriers"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+with col2:
+
+    spend_by_goods = (
+        filtered
+        .groupby("Type of Goods", as_index=False)["Value EUR"]
+        .sum()
+    )
+
+    fig = px.pie(
+        spend_by_goods,
+        names="Type of Goods",
+        values="Value EUR",
+        title="FG vs NFG"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+# ----------------------------------------------------------
+
+route_spend = (
+    filtered
+    .groupby(
+        ["Origin", "Destination"],
+        as_index=False
+    )["Value EUR"]
+    .sum()
+    .sort_values("Value EUR", ascending=False)
+    .head(20)
+)
+
+fig = px.bar(
+    route_spend,
+    x="Origin",
+    y="Value EUR",
+    color="Destination",
+    title="Top Freight Lanes"
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# ==========================================================
+# DETAIL TABLE
+# ==========================================================
+
+st.subheader("Detailed Freight Cost Data")
+
+st.dataframe(
+    filtered.sort_values(
+        "Date",
+        ascending=False
+    ),
+    use_container_width=True,
+    height=500
+)
+
+# ==========================================================
+# EXPORT
+# ==========================================================
+
+csv = filtered.to_csv(index=False).encode("utf-8")
+
+st.download_button(
+    "Download Filtered Data",
+    csv,
+    "freight_spend.csv",
+    "text/csv"
+)
+
+README.md
+Freight Cost Analytics Dashboard
+Overview
+
+This application consolidates freight costs from:
+
+Manual Accruals
+SAP ERP
+
+and produces a unified freight spend dashboard with all costs converted to EUR.
+
+The application allows logistics, transportation, finance, and supply chain teams to:
+
+Analyze actual freight spend
+Compare carriers
+Compare FG vs NFG costs
+Analyze shipping lanes
+Filter costs dynamically
+Export filtered datasets
+Business Logic
+
+The application standardizes both data sources into the following model:
+
+Field	DescriptionCarrier	Carrier name
+Type of Goods	FG / NFG
+Date	Shipment date
+Origin	Shipping origin
+Destination	Delivery location
+Value	Original freight amount
+Currency	Original currency
+Value EUR	Converted amount in EUR
+Manual Accruals Mapping
+Dashboard Field	Manual Accruals ColumnCarrier	Carrier Description
+Type of Goods	PBU
+Date	Planned Arrival Date-Last Stop
+Origin	Source Location Description
+Destination	Destination Location Descripti
+Value	Net Amt in Doc Crcy
+Currency	Currency
+Carrier Cleaning Rule
+
+When Carrier Description contains:
+
+DHL/ABC
+
+
+the dashboard keeps:
+
+DHL
+
+
+Everything after "/" is removed.
+
+SAP ERP Mapping
+Dashboard Field	SAP ERP ColumnCarrier	ServcAgent
+Type of Goods	Product Hierarchy
+Date	Deliv.Date
+Origin	ShPt
+Destination	Ship-To
+Value	Loc.curr.amount
+Currency	Local Curr.
+Carrier Enrichment
+
+SAP ERP ServcAgent is linked to:
+
+ERP Carrier Name
+
+
+Relationship:
+
+SAP ERP.ServcAgent
+=
+ERP Carrier Name.ServcAgent
+
+
+Result:
+
+Carrier = ERP Carrier Name.Name 1
+
+Goods Classification
+
+Product Hierarchy logic:
+
+Starts with 1 -> FG
+Starts with 4 -> FG
+Anything else -> NFG
+
+
+Examples:
+
+1000000 → FG
+4000000 → FG
+7000000 → NFG
+8000000 → NFG
+
+Origin Enrichment
+
+Relationship:
+
+SAP ERP.ShPt
+=
+ERP Shipping Point.ShPt
+
+
+Result:
+
+Origin = ERP Shipping Point.Description
+
+
+Special case:
+
+ShPt empty
+
+
+Result:
+
+Origin = Import
+
+Destination Enrichment
+Standard Flow
+
+Relationship:
+
+SAP ERP.Ship-To
+=
+ERP Customers.Ship-To
+
+
+Result:
+
+Destination = ERP Customers.Name 1
+
+Fallback Logic
+
+When Ship-To is empty:
+
+SAP ERP.Plnt
+=
+ERP Plants.Plnt
+
+
+Result:
+
+Destination = ERP Plants.Name 1
+
+Currency Conversion
+
+All costs are converted to EUR.
+
+Relationship:
+
+Currency
+=
+Currency conversion table.Currency
+
+
+Formula:
+
+Value EUR = Value × Conversion Rate
+
+
+Exception:
+
+Currency = EUR
+
+
+Formula:
+
+Value EUR = Value
+
+Folder Structure
+project/
+│
 ├── app.py
 ├── requirements.txt
-└── README.md
-```
+│
+├── master_data/
+│   ├── Currency conversion table.xlsx
+│   ├── ERP Carrier Name.xlsx
+│   ├── ERP Customers.xlsx
+│   ├── ERP Plants.xlsx
+│   └── ERP Shipping Point.xlsx
+│
+└── uploads/
 
-## 3. Required input files
+Installation
 
-All ten files are required by the current implementation. Supported formats are `.xlsx`, `.xlsm`, `.xls`, and `.csv`.
+Create virtual environment:
 
-### Cost files
+python -m venv venv
 
-- Manual accruals
-- SAP ERP
-- SAP TM
 
-### Reference files
+Activate:
 
-- ERP Carrier Name
-- ERP Shipping Point
-- ERP Customers
-- ERP Plants
-- TM FO
-- TM FB
-- Currency conversion table
+Windows:
 
-Column matching is case-insensitive and ignores spaces and punctuation, but the business column names below should still be used whenever possible.
+venv\Scripts\activate
 
-## 4. Transformation rules
 
-### 4.1 Manual accruals
+Linux / Mac:
 
-- **Carrier**: `Carrier Description`. The first slash and all text after it are removed. For example, `Carrier ABC / 123` becomes `Carrier ABC`.
-- **Type of goods**: `PBU`.
-- **Date**: `Planned Arrival Date-Last Stop`.
-- **Origin**: `Source Location Description`.
-- **Destination**: `Destination Location Descripti` or `Destination Location Description`.
-- **Value**: `Net Amt in Doc Crcy`.
-- **Currency**: `Currency`.
+source venv/bin/activate
 
-### 4.2 SAP ERP
 
-- **Carrier**: `ServcAgent` is matched to the carrier reference file and returns `Name 1`. If no match is found, the original service-agent code is retained.
-- **Type of goods**: `Product Hierarchy` starting with `1` or `4` becomes `FG`; all other values become `NFG`.
-- **Date**: `Deliv.Date`.
-- **Origin**: `ShPt` is matched to `Description` in the shipping-point reference file. If `ShPt` is empty, origin is `Import`. If a non-empty code is not mapped, the original code is retained.
-- **Destination**: `Ship-To` is matched to `Name 1` in the customer reference file. If `Ship-To` is empty, `Plnt` is matched to `Name 1` in the plant reference file. Unmapped non-empty codes are retained.
-- **Value**: `Loc.curr.amount`.
-- **Currency**: `Local Curr.`.
+Install dependencies:
 
-The lookup file needs a key column. The app accepts common alternatives:
-
-- Carrier key: `ServcAgent`, `Service Agent`, `Number`, or `Vendor`
-- Shipping-point key: `ShPt`, `Shipping Point`, or `Code`
-- Customer key: `Ship-To`, `Ship To`, `Customer`, or `Number`
-- Plant key: `Plnt`, `Plant`, or `Code`
-
-### 4.3 SAP TM
-
-The SAP TM cost file supplies:
-
-- **Carrier**: `Invoicing Party`
-- **Value**: `Net Amt in Doc Crcy`
-- **Currency**: `Currency`
-- **Type of goods**: `Unknown`, because the source does not provide it
-
-A freight-document column is required. Accepted names include `Freight Document`, `Freight Document Number`, `Freight Doc.`, `Freight Doc`, `Freight Order`, and `Freight Booking`.
-
-For freight-document numbers starting with `68`, TM FO provides:
-
-- **Date**: `Actual Delivered Date`; if empty, `Planned Arrival Date-Last Stop`
-- **Origin**: `Source Location Description`
-- **Destination**: `Destination Location Descripti` or its full spelling
-
-For freight-document numbers starting with `69`, TM FB provides:
-
-- **Date**: `Expected Arrival Date`
-- **Origin**: `Source Location Description`
-- **Destination**: `Destination Location Descripti` or its full spelling
-
-Documents not starting with `68` or `69` remain in the output, but TM date, origin, and destination are left empty and displayed as `Unknown` where appropriate.
-
-## 5. Currency conversion
-
-The currency table must contain:
-
-- A currency column named `Currency`, `From Currency`, `Source Currency`, `Curr.`, or `Local Curr.`
-- A rate column named `Conversion Rate`, `Rate`, `Rate to EUR`, `EUR Rate`, or `Exchange Rate`
-
-EUR is automatically assigned a rate of `1.0`.
-
-The sidebar offers two rate conventions:
-
-1. **1 unit of currency = rate EUR**
-   - Formula: `Value EUR = Value × FX Rate`
-2. **1 EUR = rate units of currency**
-   - Formula: `Value EUR = Value ÷ FX Rate`
-
-Select the convention that matches the uploaded table. A missing rate leaves `Value EUR` blank and triggers a warning.
-
-> Important: The current application uses one rate per currency. If the conversion table contains several dated rates for the same currency, the last row for that currency is used. For historical daily or monthly rates, extend the lookup to include an effective date and merge on both currency and date.
-
-## 6. Installation
-
-### Prerequisites
-
-- Python 3.10 or later
-- `pip`
-
-### Create and activate a virtual environment
-
-Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-Windows Command Prompt:
-
-```bat
-python -m venv .venv
-.venv\Scripts\activate.bat
-```
-
-macOS or Linux:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### Install dependencies
-
-```bash
 pip install -r requirements.txt
-```
 
-## 7. Run the application
-
-From the project folder:
-
-```bash
+Running the Application
 streamlit run app.py
-```
 
-Streamlit normally opens the app at `http://localhost:8501`.
 
-## 8. Using the dashboard
+The dashboard opens automatically in the browser.
 
-1. Open the application.
-2. Upload each of the ten files in the sidebar.
-3. Select the currency-rate convention.
-4. Click **Build dashboard**.
-5. Review any missing-rate warning or column error.
-6. Use sidebar filters to slice the consolidated data.
-7. Review KPIs and charts.
-8. Open the detailed transaction table.
-9. Click **Download filtered data (CSV)** to export the current selection.
+Default URL:
 
-An empty multi-select means **All**. Filters are applied sequentially, so later filter choices show values available after earlier filters have been applied.
+http://localhost:8501
 
-## 9. Dashboard content
+Dashboard Features
+KPI Cards
+Total Spend EUR
+Shipment Count
+Number of Carriers
+Number of Origins
+Interactive Filters
+Carrier
+Type of Goods
+Origin
+Destination
+Source System
+Visualizations
+Monthly Spend Trend
 
-### KPIs
+Tracks freight spend evolution over time.
 
-- Freight cost in EUR
-- Number of transactions
-- Number of distinct carriers
-- Average EUR cost per transaction
+Top Carriers
 
-### Visuals
+Shows highest spending carriers.
 
-- Monthly freight cost by source
-- Top 15 carriers by EUR cost
-- Top 15 origin-to-destination routes by EUR cost
-- Cost split by source system
+FG vs NFG Analysis
 
-### Detail and controls
+Distribution of freight spend by product category.
 
-- Interactive transaction table
-- Period, source, carrier, goods type, origin, destination, and currency filters
-- CSV export of filtered rows
-- Data-quality summary
+Top Freight Lanes
 
-## 10. Data quality and reconciliation
+Origin → Destination spend analysis.
 
-Before publishing the dashboard, complete these checks:
+Detailed Dataset
 
-1. Reconcile transaction counts and original-currency totals against each input file.
-2. Confirm whether cost values can be negative and whether credits should offset spend.
-3. Confirm the exchange-rate convention and rate effective date.
-4. Review unmapped ERP carrier, shipping point, customer, and plant codes.
-5. Review TM documents without FO or FB detail matches.
-6. Review missing or invalid dates.
-7. Confirm whether duplicate freight documents are valid. The master-data and TM-detail lookups keep the last record for duplicate keys.
-8. Validate totals after EUR conversion with Finance.
-9. Confirm whether manual accruals and posted ERP/TM costs can overlap. The app consolidates records but does not automatically eliminate cross-source duplicates.
+Complete filtered transaction list available on screen.
 
-## 11. Error handling
+Export Functionality
 
-The app stops and displays a detailed exception when:
+Users can export filtered data as CSV.
 
-- A required file is missing
-- A required column cannot be found
-- A spreadsheet cannot be read
-- A numeric amount cannot be parsed
-- A lookup cannot be built
+Recommended Enhancements
 
-For missing FX rates, the application continues, warns the user, and leaves the EUR value blank.
+Future versions may include:
 
-## 12. Parsing behavior
+Budget vs Actual comparison
+Carrier performance KPIs
+Cost per KG
+Cost per Shipment
+Freight accrual reconciliation
+Power BI embedding
+User authentication
+Multi-currency reporting
+Year-over-year trend analysis
+Forecasting and spend prediction
 
-- Headers are matched after converting to lowercase and removing punctuation and spaces.
-- Lookup keys are converted to text, trimmed, and trailing `.0` is removed to reduce Excel numeric-format mismatches.
-- Amount parsing supports numbers, spaces, currency symbols, parentheses for negatives, and common comma/decimal conventions.
-- Dates support native Excel dates, common day-first text dates, and Excel serial dates.
-- Blank descriptive dimensions become `Unknown` in the dashboard.
-
-## 13. Security and privacy
-
-- Uploaded files are processed in the running Streamlit session.
-- The supplied code does not write uploads to disk or call an external API.
-- Deployment logging, authentication, backups, retention, and infrastructure security depend on the hosting environment.
-- For production use, deploy behind corporate authentication and restrict access to authorized freight and finance users.
-- Do not expose commercially sensitive carrier rates or personally identifiable information unnecessarily.
-
-## 14. Production deployment options
-
-The app may be hosted on an approved internal platform, a container service, or a virtual machine.
-
-Example local Dockerfile, if your environment permits containers:
-
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
-EXPOSE 8501
-CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"]
-```
-
-For production, also configure:
-
-- Single sign-on or reverse-proxy authentication
-- TLS
-- Maximum upload size
-- Resource limits
-- Monitoring and health checks
-- Dependency scanning
-- Controlled release and rollback procedures
-
-## 15. Known assumptions
-
-- Each uploaded workbook uses its first worksheet.
-- The currency table contains one usable rate per currency.
-- The requested three cost sources are additive.
-- `Freight Document` values are preserved as text, including meaningful leading zeros when the source itself preserves them.
-- TM details are joined many-to-one by freight-document number.
-- When duplicate lookup keys exist, the last occurrence is used.
-- The app does not derive Type of goods for SAP TM and uses `Unknown`.
-- The app does not deduplicate possible overlap between manual accruals, SAP ERP, and SAP TM.
-
-## 16. Customization points
-
-Common extensions include:
-
-- Add dated FX rates and date-effective conversion
-- Add user-selectable workbook sheets
-- Add automatic cross-source duplicate detection
-- Add budget, forecast, or prior-year comparisons
-- Add lane, country, region, or business-unit mappings
-- Store curated data in a database rather than uploading files each session
-- Schedule ingestion and publish a governed semantic model
-- Add role-based access and audit logging
-- Add tests for transformations using representative masked data
-
-## 17. Troubleshooting
-
-### Missing column error
-
-Compare the error's expected column names with the actual file header. Remove merged cells and title rows above the header. Ensure the correct worksheet is first.
-
-### Lookup values do not map
-
-Check leading zeros, hidden spaces, and whether the reference file uses the expected key. The app normalizes trimming and `.0`, but it cannot reconstruct leading zeros already removed by Excel.
-
-### EUR totals are too high or too low
-
-Switch the rate convention and verify the definition of the uploaded rate. Also check whether the table is direct-to-EUR or requires a cross-rate.
-
-### Dates look incorrect
-
-Provide real Excel dates or an unambiguous text date. Text dates are interpreted day-first by default.
-
-### CSV does not open correctly
-
-The export uses UTF-8 with a byte-order mark so European characters normally display correctly in Excel.
-
-## 18. Suggested acceptance criteria
-
-- All ten supported files load successfully.
-- Manual carrier descriptions are truncated at the first slash.
-- ERP carrier, origin, and destination names map correctly.
-- Empty ERP shipping points become `Import`.
-- ERP goods type is classified as FG or NFG correctly.
-- TM 68 and 69 documents use their respective detail source and date logic.
-- Every currency either has a valid EUR rate or is clearly flagged.
-- Dashboard totals reconcile with an independently calculated sample.
-- Every filter updates KPIs, visuals, detail, and export consistently.
-- Downloaded data matches the visible filtered selection.
+This solution provides a complete freight cost analytics application ready for deployment with Streamlit.

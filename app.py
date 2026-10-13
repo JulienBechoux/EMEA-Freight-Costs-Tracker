@@ -476,4 +476,14 @@ if manual_file and sap_file:
 
 else:
 
-    st.info("Please upload both files to start the analysis.")
+    st.info(
+        "Please upload both files to start the analysis."
+    )
+    from pathlib import Path
+import streamlit as st
+
+st.write("Current files in repo:")
+
+for f in Path(".").rglob("*"):
+    st.write(str(f))
+``
